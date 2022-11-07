@@ -4,16 +4,16 @@ import json
 import re
 import time
 from urllib.parse import quote, urlencode
+from attr import has
 
 import requests
 import seleniumwire
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
-from selenium.common.exceptions import TimeoutException
 
 from ..exceptions import *
-from ..helpers import extract_tag_contents
+from ..helpers import extract_tag_contents, add_if_not_replace
 
 from typing import TYPE_CHECKING, ClassVar, Iterator, Optional
 
@@ -94,23 +94,19 @@ class User(Base):
                 "You must provide the username when creating this class to use this method."
             )
 
-        quoted_username = quote(self.username)
-        r = requests.get(
-            "https://tiktok.com/@{}?lang=en".format(quoted_username),
-            headers={
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9",
-                "path": "/@{}".format(quoted_username),
-                "Accept-Encoding": "gzip, deflate",
-                "Connection": "keep-alive",
-                "User-Agent": self.parent._user_agent,
-            },
-            proxies=User.parent._format_proxy(kwargs.get("proxy", None)),
-            cookies=User.parent._get_cookies(**kwargs),
-            **User.parent._requests_extra_kwargs,
-        )
+        driver = User.parent._browser
 
-        data = extract_tag_contents(r.text)
-        user = json.loads(data)
+        url = f"https://www.tiktok.com/@{self.username}"
+        driver.get(url)
+        self.check_initial_call(url)
+        self.wait_for_content_or_captcha('user-post-item')
+
+        # get initial html data
+        html_req_path = f"@{self.username}"
+        initial_html_request = self.get_requests(html_req_path)[0]
+        html_body = self.get_response_body(initial_html_request)
+        tag_contents = extract_tag_contents(html_body)
+        user = json.loads(tag_contents)
 
         user_props = user["props"]["pageProps"]
         if user_props["statusCode"] == 404:
@@ -120,7 +116,7 @@ class User(Base):
 
         return user_props["userInfo"]
 
-    def videos(self, count=30, cursor=0, **kwargs) -> Iterator[Video]:
+    def videos(self, count=200, batch_size=100, **kwargs) -> Iterator[Video]:
         """
         Returns an iterator yielding Video objects.
 
@@ -135,85 +131,143 @@ class User(Base):
             # do something
         ```
         """
+        amount_yielded = 0
+        cursor = 0
+        final_cursor = 9999999999999999999999999999999
 
+        all_scraping = True
+        if all_scraping or 'videos' not in self.parent.request_cache:
+            all_videos, finished, final_cursor = self._get_videos_and_req(count, all_scraping)
+
+            amount_yielded += len(all_videos)
+            yield from all_videos
+
+            if finished:
+                return
+
+        data_request = self.parent.request_cache['videos']
+
+        while amount_yielded < count and cursor < final_cursor:
+            
+            next_url = add_if_not_replace(data_request.url, "id=([0-9]+)", f"id={self.user_id}", f"&id={self.user_id}")
+            next_url = add_if_not_replace(next_url, "secUid=([0-9]+)", f"secUid={self.sec_uid}", f"&secUid={self.sec_uid}")
+            next_url = add_if_not_replace(next_url, "cursor=([0-9]+)", f"cursor={cursor}", f"&cursor={cursor}")
+
+            r = requests.get(next_url, headers=data_request.headers)
+            res = r.json()
+
+            if res.get('type') == 'verify':
+                # force new request for cache
+                self._get_videos_and_req()
+
+            videos = res.get('itemList', [])
+            cursor = int(res['cursor'])
+
+            if videos:
+                amount_yielded += len(videos)
+                yield from [self.parent.video(data=video) for video in videos]
+
+            has_more = res.get("hasMore")
+            if not has_more:
+                self.parent.logger.info(
+                    "TikTok isn't sending more TikToks beyond this point."
+                )
+                return
+
+            self.parent.request_delay()
+
+    def _get_videos_and_req(self, count, all_scraping):
         driver = User.parent._browser
 
-        driver.get(f"https://www.tiktok.com/@{self.username}")
-
+        url = f"https://www.tiktok.com/@{self.username}"
+        driver.get(url)
+        self.check_initial_call(url)
         self.wait_for_content_or_captcha('user-post-item')
 
-        request_num = 1
+        # get initial html data
+        html_req_path = f"@{self.username}"
+        initial_html_request = self.get_requests(html_req_path)[0]
+        html_body = self.get_response_body(initial_html_request)
+        tag_contents = extract_tag_contents(html_body)
+        res = json.loads(tag_contents)
+
         amount_yielded = 0
-        searched_urls = []
+        all_videos = []
 
-        while amount_yielded < count:
+        if 'ItemModule' in res:
+            videos = list(res['ItemModule'].values())
 
-            if request_num == 1:
-                path = f"@{self.username}"
-            elif request_num > 1:
-                path = "api/post/item_list"
+            video_users = res["UserModule"]["users"]
+            for video in videos:
+                video['author'] = video_users[video['author']]
 
-            search_requests = self.get_requests(path)
-            for request in search_requests:
-                searched_urls.append(request.url)
-                body = self.get_response_body(request)
+            amount_yielded += len(videos)
+            all_videos += [self.parent.video(data=video) for video in videos]
 
-                if request_num == 1:
-                    tag_contents = extract_tag_contents(body)
-                    res = json.loads(tag_contents)
+            if amount_yielded >= count:
+                return all_videos, True, None
 
-                    videos = [val for key, val in res['ItemModule'].items()]
-                    for video in videos:
-                        video['createTime'] = int(video['createTime'])
-                        author_name = video['author']
-                        video['author'] = {
-                            "id": video["authorId"],
-                            "uniqueId": author_name,
-                            "nickname": video["nickname"],
-                            "avatarThumb": video["avatarThumb"],
-                            "signature": res["UserModule"]["users"][author_name]["signature"],
-                            "verified": res["UserModule"]["users"][author_name]["verified"],
-                            "secUid": video["authorSecId"],
-                            "secret": res["UserModule"]["users"][author_name]["secret"],
-                            "ftc": res["UserModule"]["users"][author_name]["ftc"],
-                            "relation": res["UserModule"]["users"][author_name]["relation"],
-                            "openFavorite": res["UserModule"]["users"][author_name]["openFavorite"],
-                            "commentSetting": res["UserModule"]["users"][author_name]["commentSetting"],
-                            "duetSetting": res["UserModule"]["users"][author_name]["duetSetting"],
-                            "stitchSetting": res["UserModule"]["users"][author_name]["stitchSetting"],
-                            "privateAccount": res["UserModule"]["users"][author_name]["privateAccount"]
-                        }
+            has_more = res['ItemList']['user-post']['hasMore']
+            if not has_more:
+                User.parent.logger.info(
+                    "TikTok isn't sending more TikToks beyond this point."
+                )
+                return all_videos, True, None
 
-                elif request_num > 1:
-                    res = json.loads(body)
-                    if res.get('type') == 'verify':
-                        # this is the captcha denied response
-                        continue
 
-                    videos = res.get("itemList", [])
+        data_request_path = "api/post/item_list"
+        data_urls = []
+        tries = 1
+        MAX_TRIES = 6
+
+        valid_data_request = False
+        cursors = []
+        while all_scraping or not valid_data_request:
+            for _ in range(tries):
+                self.slight_scroll_up()
+                self.scroll_to_bottom()
+                self.parent.request_delay()
+            try:
+                self.wait_for_requests(data_request_path, timeout=tries*4)
+            except TimeoutException:
+                tries += 1
+                if tries > MAX_TRIES:
+                    raise
+                continue
+
+            data_requests = [req for req in self.get_requests(data_request_path) if req.url not in data_urls]
+
+            for data_request in data_requests:
+                data_urls.append(data_request.url)
+                res_body = self.get_response_body(data_request)
+
+                if not res_body:
+                    tries += 1
+                    if tries > MAX_TRIES:
+                        raise EmptyResponseException('TikTok backend broke')
+                    continue
+
+                valid_data_request = True
+                self.parent.request_cache['videos'] = data_request
+
+                res = json.loads(res_body)
+                videos = res.get("itemList", [])
+                cursors.append(int(res['cursor']))
 
                 amount_yielded += len(videos)
-                for video in videos:
-                    yield self.parent.video(data=video)
+                all_videos += [self.parent.video(data=video) for video in videos]
 
-                if request_num == 1:
-                    has_more = res['ItemList']['user-post']['hasMore']
-                else:
-                    has_more = res.get("hasMore", False)
+                if amount_yielded >= count:
+                    return all_videos, True, None
 
+                has_more = res.get("hasMore", False)
                 if not has_more:
                     User.parent.logger.info(
                         "TikTok isn't sending more TikToks beyond this point."
                     )
-                    return
+                    return all_videos, True, None
 
-            # Scroll down to bottom
-            self.scroll_to_bottom()
-            self.wait_until_not_skeleton_or_captcha('video-skeleton-container')
-
-            request_num += 1
-
-            self.parent.request_delay()
+        return all_videos, False, min(cursors)
 
 
     def liked(self, count: int = 30, cursor: int = 0, **kwargs) -> Iterator[Video]:
